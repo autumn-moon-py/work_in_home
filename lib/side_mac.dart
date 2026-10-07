@@ -28,6 +28,16 @@ class MacSide implements LocalSide {
   final Map<String, String> _attempted = <String, String>{};
   final Map<String, bool> _prevMounted = <String, bool>{};
   final Map<String, DateTime> _retryAfter = <String, DateTime>{};
+  /// linkId -> 上一轮对端是否可达：掉线期间"重挂窗口"会被消耗掉，
+  /// 靠这里的翻转把"对端恢复"补成一次新的自动挂载机会
+  final Map<String, bool> _prevReachable = <String, bool>{};
+  /// linkId -> 因"对端不可达"清掉过残留挂载，等对端恢复后补挂一次。
+  /// 残留挂载被清掉后"上一轮已挂载"这个重挂窗口就没了，靠这里补机会；
+  /// 只允许一次尝试，挂载失败（例如认证）不再无限重试
+  final Set<String> _pendingRemount = <String>{};
+  /// host -> 本轮巡检的可达结论：同一个对端的多个共享区只探一次，
+  /// 免得同轮给出互相矛盾的判定（一个判掉线被卸载、另一个判正常）
+  final Map<String, bool> _reachableCache = <String, bool>{};
 
   /// 已告警过的"无配置归属"挂载点；挂载消失后会移除，再次出现可重新告警
   final Set<String> _loggedOrphans = <String>{};
@@ -238,6 +248,7 @@ class MacSide implements LocalSide {
 
   @override
   Future<void> checkHealth({bool initial = false}) async {
+    _reachableCache.clear();
     final links = ConfigStore.loadLinks();
     final mounts = await MacSmb.smbMounts();
     final targets =
@@ -250,15 +261,14 @@ class MacSide implements LocalSide {
       if (_busy.contains(link.id)) continue;
       final mounted = mounts.containsKey(MacSmb.keyOf(link));
       final previous = _prevMounted[link.id];
-      final reachable = await MacSmb.hostReachable(
-        link.sourceHost,
-        timeout: const Duration(seconds: 3),
-      );
+      final reachable = await _reachableOf(link.sourceHost);
       if (previous != null && previous != mounted) {
         Log.i('health',
             '${link.displayName} 挂载状态翻转：${previous ? '已挂载' : '未挂载'} -> ${mounted ? '已挂载' : '未挂载'}（对端可达=$reachable）');
       }
-      // 只用于界面上的状态提示，不影响挂载决策
+      // 对端由不可达转为可达，视作一次新的自动挂载机会
+      final recovered = _prevReachable[link.id] == false && reachable;
+      _prevReachable[link.id] = reachable;
       if (reachable) {
         _unreachable.remove(link.id);
       } else {
@@ -272,12 +282,15 @@ class MacSide implements LocalSide {
         await MacSmb.unmount(link);
         _busy.remove(link.id);
         _retryAfter[link.id] = DateTime.now().add(const Duration(seconds: 10));
+        _pendingRemount.add(link.id);
       } else if (!mounted && reachable && link.autoMount) {
-        // 只在启动首轮或"原本已挂载但掉线"时自动重挂，
+        // 只在启动首轮、"原本已挂载但掉线"或"对端从不可达恢复"时自动重挂，
         // 避免认证失败后反复弹出系统登录窗
         final fingerprint = _fingerprintOf(link);
         final shouldTry = (initial && _attempted[link.id] != fingerprint) ||
-            _prevMounted[link.id] == true;
+            _prevMounted[link.id] == true ||
+            recovered ||
+            _pendingRemount.contains(link.id);
         final retryAt = _retryAfter[link.id];
         final ready = retryAt == null || DateTime.now().isAfter(retryAt);
         final skipReason = !shouldTry
@@ -290,11 +303,13 @@ class MacSide implements LocalSide {
           Log.i('health', '${link.displayName} 跳过自动挂载：$skipReason');
         }
         if (shouldTry && ready) {
-          Log.i('health', '${link.displayName} 触发自动挂载（首轮=$initial）');
+          Log.i('health',
+              '${link.displayName} 触发自动挂载（首轮=$initial，对端恢复=$recovered）');
           _busy.add(link.id);
           final error = await MacSmb.mount(link);
           _busy.remove(link.id);
           _attempted[link.id] = fingerprint;
+          _pendingRemount.remove(link.id);
           Log.i('health',
               error == null ? '${link.displayName} 自动挂载成功' : '${link.displayName} 自动挂载失败：$error');
           // ponytail: 固定 30 秒退避，够用；若认证频繁失败再考虑指数退避
@@ -304,6 +319,25 @@ class MacSide implements LocalSide {
       }
       _prevMounted[link.id] = mounted;
     }
+  }
+
+  /// 单次 TCP 探测在虚拟网抖动下会误判掉线，而误判的代价是强制卸载一个正常挂载；
+  /// 失败时隔 2 秒复测一次，两次都失败才判死
+  static Future<bool> _hostReachable(String host) async {
+    const Duration timeout = Duration(seconds: 3);
+    if (await MacSmb.hostReachable(host, timeout: timeout)) return true;
+    await Future<void>.delayed(const Duration(seconds: 2));
+    return MacSmb.hostReachable(host, timeout: timeout);
+  }
+
+  /// 同一个对端在本轮巡检里只探一次，结论给它的所有共享区共用
+  Future<bool> _reachableOf(String host) async {
+    final target = host.trim();
+    final cached = _reachableCache[target];
+    if (cached != null) return cached;
+    final value = await _hostReachable(target);
+    _reachableCache[target] = value;
+    return value;
   }
 
   /// 系统里还挂着、但配置中已没有对应共享区的挂载点：应用不会去卸载它，只会在这里报一次

@@ -21,14 +21,16 @@ class WinSmb {
 
   /// 在本机当前会话执行 PowerShell，可选把一行文本（密码）从 stdin 送进脚本。
   /// 脚本开头先切到 UTF-8 输出，否则中文路径会按系统 ANSI 编码输出而乱码。
+  ///
+  /// 用 pwsh 7 且不带 -ExecutionPolicy：后者与 -EncodedCommand 同时出现会被本机
+  /// 安全策略整条杀掉（无输出、退出码 -1），Windows PowerShell 5.1 同样中招。
   static Future<({int code, String out, String err})> _runLocal(
     String script, {
     String? stdinLine,
   }) async {
-    final process = await Process.start('powershell', <String>[
+    final process = await Process.start('pwsh', <String>[
       '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
+      '-NonInteractive',
       '-EncodedCommand',
       _encode('[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$script'),
     ]);
@@ -60,8 +62,8 @@ class WinSmb {
           "  ('ERR ' + \$_.Exception.Message) | Out-File -Encoding utf8 -FilePath '${out.path}'\n"
           '}\n';
 
-      final launch = 'Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden '
-          "-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','${_encode(inner)}'";
+      final launch = 'Start-Process pwsh -Verb RunAs -Wait -WindowStyle Hidden '
+          "-ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','${_encode(inner)}'";
       final result = await _runLocal(launch);
       if (result.code != 0) {
         return '提权调用失败：${result.err.trim()}';

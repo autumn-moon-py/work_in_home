@@ -311,6 +311,12 @@ else {
 
   /// 把一段 PowerShell 脚本编码后交给 Windows 执行。
   /// 用 -EncodedCommand 传递，绕开 ssh→cmd→powershell 三层的引号转义问题。
+  ///
+  /// 两个必须遵守的点（都是实测踩出来的，改回去必炸）：
+  /// 1. 用 pwsh 7，不用 Windows PowerShell 5.1：后者作为 ssh 的直接子进程执行
+  ///    -EncodedCommand 时会被静默杀掉（无输出、ssh 返回 255）。
+  /// 2. 绝不能带 -ExecutionPolicy Bypass：它与 -EncodedCommand 同时出现时会被
+  ///    本机安全策略整条杀掉，两个解释器都一样。
   static Future<({int code, String out, String err})> _runOnWindows(
     PeerTarget target,
     String script, {
@@ -333,10 +339,9 @@ else {
       '-o',
       'StrictHostKeyChecking=accept-new',
       '${target.sshUser.trim()}@${target.host.trim()}',
-      'powershell',
+      'pwsh',
       '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
+      '-NonInteractive',
       '-EncodedCommand',
       encoded,
     ]);

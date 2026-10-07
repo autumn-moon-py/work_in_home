@@ -6,7 +6,9 @@ import 'package:flutter/services.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'autostart_win.dart';
 import 'log.dart';
+import 'login_item.dart';
 import 'model.dart';
 import 'side.dart';
 import 'sync.dart';
@@ -26,6 +28,9 @@ class _WinShareHomeState extends State<WinShareHome>
   List<ShareLink> _links = <ShareLink>[];
   String _host = '';
   bool _globalBusy = false;
+
+  /// Windows 侧的开机自启开关状态（读注册表得到，仅 Windows 用）
+  bool _autostartOn = false;
   final Set<String> _busy = <String>{};
   Timer? _timer;
   late final LinkSync _sync;
@@ -86,6 +91,8 @@ class _WinShareHomeState extends State<WinShareHome>
   /// 按当前状态重建菜单栏菜单，让菜单里的摘要与勾选保持最新
   Future<void> _syncTrayMenu() async {
     if (!Platform.isMacOS) return;
+    // 登录项的勾选以系统为准，每次重建菜单都重新问一次
+    final loginStatus = await LoginItem.status();
     final List<MenuItem> items = <MenuItem>[
       MenuItem(key: 'show', label: '打开主窗口'),
       MenuItem.separator(),
@@ -113,6 +120,14 @@ class _WinShareHomeState extends State<WinShareHome>
         key: 'starthidden',
         label: '启动时隐藏窗口',
         checked: ConfigStore.loadStartHidden(),
+      ),
+      MenuItem.checkbox(
+        key: 'autostart',
+        // 系统里关掉但记录还在时给个提示，否则用户会奇怪为什么勾不上
+        label: loginStatus == LoginItemStatus.requiresApproval
+            ? '开机自启动（待系统允许）'
+            : '开机自启动',
+        checked: loginStatus.isOn,
       ),
       MenuItem.separator(),
       MenuItem(key: 'quit', label: '退出'),
@@ -143,10 +158,29 @@ class _WinShareHomeState extends State<WinShareHome>
       case 'starthidden':
         ConfigStore.saveStartHidden(!ConfigStore.loadStartHidden());
         await _syncTrayMenu();
+      case 'autostart':
+        await _toggleAutoStart();
       case 'quit':
         await trayManager.destroy();
         await windowManager.destroy();
     }
+  }
+
+  /// 切换开机自启动。成功与否以系统返回的状态为准，切完再读一次刷新勾选，
+  /// 避免界面显示的和系统里实际生效的不一致
+  Future<void> _toggleAutoStart() async {
+    final before = await LoginItem.status();
+    if (before == LoginItemStatus.unsupported) {
+      _toast('当前系统不支持开机自启动（需要 macOS 13 及以上）');
+      return;
+    }
+    final error = await LoginItem.setEnabled(!before.isOn);
+    if (error != null) await _showError('设置开机自启动失败', error);
+    if (await LoginItem.status() == LoginItemStatus.requiresApproval) {
+      _toast('系统里这项是关闭的，需要在「登录项」里允许');
+      await LoginItem.openSystemSettings();
+    }
+    await _syncTrayMenu();
   }
 
   void _toast(String message) {
@@ -221,13 +255,24 @@ class _WinShareHomeState extends State<WinShareHome>
   Future<void> _refresh({bool full = false}) async {
     final host = await side.peerHost();
     await side.refresh(full: full);
+    // 自启开关以系统为准，跟着一起刷新，避免界面与注册表脱节
+    final autostartOn = Platform.isWindows && await AutostartWin.isEnabled();
     if (!mounted) return;
     setState(() {
       _host = host;
+      _autostartOn = autostartOn;
       // 列表以磁盘为准：同步可能刚在别处改过这份数据
       _links = ConfigStore.loadLinks();
     });
     await _syncTrayMenu();
+  }
+
+  /// 切换 Windows 侧的开机自启动，切完重新读一次注册表再刷新勾选
+  Future<void> _toggleAutostart() async {
+    final error = await AutostartWin.setEnabled(!_autostartOn);
+    if (error != null) await _showError('设置开机自启动失败', error);
+    _autostartOn = await AutostartWin.isEnabled();
+    if (mounted) setState(() {});
   }
 
   // ---------- 全局通道 ----------
@@ -527,6 +572,22 @@ class _WinShareHomeState extends State<WinShareHome>
             icon: const Icon(Icons.add),
             tooltip: '添加共享区',
           ),
+          // Windows 没有菜单栏常驻，自启开关只能放在窗口里
+          if (Platform.isWindows)
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.more_vert),
+              tooltip: '更多',
+              onSelected: (String value) {
+                if (value == 'autostart') unawaited(_toggleAutostart());
+              },
+              itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+                CheckedPopupMenuItem<String>(
+                  value: 'autostart',
+                  checked: _autostartOn,
+                  child: const Text('开机自启动'),
+                ),
+              ],
+            ),
         ],
       ),
       body: ListView(
