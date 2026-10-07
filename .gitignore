@@ -32,6 +32,12 @@ migrate_working_dir/
 .pub/
 /build/
 
+# 平台插件注册文件由 pub get 生成：两端 Flutter 版本不同会写出不同内容，入库只会制造无谓改动
+macos/Flutter/GeneratedPluginRegistrant.swift
+windows/flutter/generated_plugin_registrant.cc
+windows/flutter/generated_plugin_registrant.h
+windows/flutter/generated_plugins.cmake
+
 # Symbolication related
 app.*.symbols
 
