@@ -1,0 +1,33 @@
+{
+	"name": "lock-release",
+	"displayName": "Lock Release",
+	"description": "在资源管理器右键一键释放文件/文件夹被本地进程占用的句柄（macOS）",
+	"version": "0.1.0",
+	"publisher": "local",
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.88.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"main": "./extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "lockRelease.release",
+				"title": "释放占用",
+				"category": "Lock"
+			}
+		],
+		"menus": {
+			"explorer/context": [
+				{
+					"command": "lockRelease.release",
+					"when": "resourceScheme == file",
+					"group": "navigation@99"
+				}
+			]
+		}
+	}
+}
