@@ -39,8 +39,16 @@ class MacSide implements LocalSide {
   /// 免得同轮给出互相矛盾的判定（一个判掉线被卸载、另一个判正常）
   final Map<String, bool> _reachableCache = <String, bool>{};
 
-  /// 已告警过的"无配置归属"挂载点；挂载消失后会移除，再次出现可重新告警
-  final Set<String> _loggedOrphans = <String>{};
+  /// 上一轮挂载表快照：整表打日志会在挂载点爆炸时写出几百 KB 的单行，这里只用来算增删差异
+  Map<String, String> _prevMounts = <String, String>{};
+  /// 上一轮"无配置归属"的挂载点集合：集合变化时才记一行，且整行截断
+  Set<String> _orphans = <String>{};
+  /// linkId -> 本轮巡检统计到的"系统按需建立"的子挂载条数
+  Map<String, int> _submountCounts = <String, int>{};
+  /// 已就子挂载告警过的共享区：回落到底才允许再次告警
+  final Set<String> _warnedSubmounts = <String>{};
+  /// 子挂载告警阈值：个位数属正常，上千条才是风暴
+  static const int _submountWarnThreshold = 50;
   /// linkId -> 已记过的自动挂载跳过原因，避免每轮巡检刷同样的行
   final Map<String, String> _skipLogged = <String, String>{};
 
@@ -196,7 +204,7 @@ class MacSide implements LocalSide {
     _peer = ConfigStore.loadPeer();
     final links = ConfigStore.loadLinks();
 
-    final mounts = await MacSmb.smbMounts();
+    final mounts = (await MacSmb.smbMounts()).points;
     final points = await MacPublish.listSharePoints();
 
     final macMounts = <String, String>{};
@@ -250,13 +258,15 @@ class MacSide implements LocalSide {
   Future<void> checkHealth({bool initial = false}) async {
     _reachableCache.clear();
     final links = ConfigStore.loadLinks();
-    final mounts = await MacSmb.smbMounts();
+    final table = await MacSmb.smbMounts();
+    final mounts = table.points;
     final targets =
         links.where((ShareLink e) => e.macIsTarget).toList(growable: false);
-    // 每轮巡检留一张挂载表快照，出问题时能定位"哪一轮之后东西变了"
-    Log.i('tick',
-        '挂载表：${mounts.isEmpty ? '无可用的 SMB 挂载' : mounts.entries.map((MapEntry<String, String> e) => '${e.key} -> ${e.value}').join(' | ')}');
+    // 整表打印在挂载点爆炸时会写出几百 KB 的单行日志，这里只记条数与增删差异
+    Log.i('tick', '挂载表：${mounts.length} 条');
+    _logMountChanges(mounts);
     _reportOrphans(mounts, targets);
+    _refreshSubmountWarnings(table.submounts, targets);
     for (final ShareLink link in targets) {
       if (_busy.contains(link.id)) continue;
       final mounted = mounts.containsKey(MacSmb.keyOf(link));
@@ -340,16 +350,63 @@ class MacSide implements LocalSide {
     return value;
   }
 
-  /// 系统里还挂着、但配置中已没有对应共享区的挂载点：应用不会去卸载它，只会在这里报一次
+  /// 挂载表相对上一轮的增删：只在真正变化时记一行，条目多时截断样本
+  void _logMountChanges(Map<String, String> mounts) {
+    final added =
+        mounts.keys.where((String k) => !_prevMounts.containsKey(k)).toList();
+    final removed =
+        _prevMounts.keys.where((String k) => !mounts.containsKey(k)).toList();
+    if (added.isEmpty && removed.isEmpty) return;
+    _prevMounts = mounts;
+    Log.i('tick',
+        '挂载表变化：新增 ${added.length}${_brief(added)}，消失 ${removed.length}${_brief(removed)}');
+  }
+
+  /// 系统里还挂着、但配置中已没有对应共享区的挂载点：应用不会去卸载它。
+  /// 挂载点爆炸时一次会出现上千条，所以按集合变化聚合成一行并截断样本
   void _reportOrphans(Map<String, String> mounts, List<ShareLink> targets) {
     final claimed = targets.map(MacSmb.keyOf).toSet();
-    for (final MapEntry<String, String> entry in mounts.entries) {
-      if (claimed.contains(entry.key)) continue;
-      if (!_loggedOrphans.add(entry.key)) continue;
-      Log.w('orphan',
-          '无配置归属的挂载点：${entry.key} -> ${entry.value}，不会被应用自动卸载');
+    final orphans = mounts.keys.where((String k) => !claimed.contains(k)).toSet();
+    if (orphans.length == _orphans.length && orphans.containsAll(_orphans)) {
+      return;
     }
-    _loggedOrphans.removeWhere((String key) => !mounts.containsKey(key));
+    _orphans = orphans;
+    if (orphans.isEmpty) return;
+    Log.w('orphan',
+        '无配置归属的挂载点 ${orphans.length} 个${_brief(orphans.toList())}，不会被应用自动卸载');
+  }
+
+  /// 样本最多列 5 条，其余折成"等 N 项"，避免单行日志再次失控
+  static String _brief(List<String> items) {
+    const int limit = 5;
+    if (items.isEmpty) return '';
+    final head = items.take(limit).join(', ');
+    return '（$head${items.length > limit ? ' 等 ${items.length} 项' : ''}）';
+  }
+
+  /// 共享内的目录联接点（junction）被访问时，macOS 会给它单独挂一条 automounted
+  /// 子挂载；条目数随遍历爆炸，正是拖慢系统的那种风暴。按共享统计，跨过阈值时告警一次。
+  /// 检测只能数挂载表——去扫描共享区本身就会触发同一批子挂载
+  void _refreshSubmountWarnings(Set<String> submounts, List<ShareLink> targets) {
+    final counts = <String, int>{};
+    for (final String key in submounts) {
+      for (final ShareLink link in targets) {
+        if (!key.startsWith('${MacSmb.keyOf(link)}/')) continue;
+        counts[link.id] = (counts[link.id] ?? 0) + 1;
+        break;
+      }
+    }
+    _submountCounts = counts;
+    for (final ShareLink link in targets) {
+      final count = counts[link.id] ?? 0;
+      if (count == 0) {
+        _warnedSubmounts.remove(link.id);
+      } else if (count >= _submountWarnThreshold &&
+          _warnedSubmounts.add(link.id)) {
+        Log.w('submount',
+            '${link.displayName} 的共享已产生 $count 个子挂载：共享内的目录联接点会被 macOS 逐个挂载，继续遍历共享区还会膨胀并拖慢系统');
+      }
+    }
   }
 
   /// 配置指纹：只关心挂载行为会用到的那几项，改过才允许再试一次自动挂载
@@ -386,9 +443,13 @@ class MacSide implements LocalSide {
     String? primaryLabel;
 
     if (macIsTarget) {
+      final submounts = _submountCounts[link.id] ?? 0;
       if (_mountIssues.contains(link.id)) {
         state = LinkState.warn;
         reason = '挂载点异常';
+      } else if (submounts >= _submountWarnThreshold) {
+        state = LinkState.warn;
+        reason = '共享内联接点已生成 $submounts 个子挂载';
       } else if (_unreachable.contains(link.id)) {
         state = LinkState.warn;
         reason = '对端不可达';

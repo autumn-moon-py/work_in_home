@@ -7,6 +7,17 @@ import 'model.dart';
 ///
 /// 挂载与认证全部交给系统自带的 SMB 客户端：应用只负责发起、监控与清理，
 /// 因此不接触也不保存任何密码（首次挂载由系统弹窗认证，凭据存入钥匙串）。
+/// 一次挂载表快照。
+///
+/// 除了"主机/共享 -> 挂载点"，还标出其中由系统按需建立的子挂载：共享内的目录
+/// 联接点（junction）被访问时 macOS 会给它单独挂一条，条目数会随遍历爆炸
+class SmbMountTable {
+  const SmbMountTable(this.points, this.submounts);
+
+  final Map<String, String> points;
+  final Set<String> submounts;
+}
+
 class MacSmb {
   static const String _open = '/usr/bin/open';
   static const String _mount = '/sbin/mount';
@@ -36,9 +47,10 @@ class MacSmb {
 
   /// 解析 mount 输出，返回 "主机/共享名" -> 系统挂载点。
   /// 每行形如：//user@host/share on /Volumes/share (smbfs, nodev, ...)
-  static Future<Map<String, String>> smbMounts() async {
+  static Future<SmbMountTable> smbMounts() async {
     final result = await Process.run(_mount, const <String>[]);
     final mounts = <String, String>{};
+    final submounts = <String>{};
     // 同一共享被挂多次时系统会造出 "名字 1" 这样的挂载点，
     // 这里先按共享分组，输出后统一告警一次
     final pointsOfKey = <String, List<String>>{};
@@ -56,10 +68,12 @@ class MacSmb {
       final key = _decodePercent(source).toLowerCase();
       final point = rest.substring(0, pathEnd);
       mounts[key] = point;
+      // 按需建立的子挂载带 automounted 选项，据此与正常挂载区分
+      if (rest.substring(pathEnd).contains('automounted')) submounts.add(key);
       (pointsOfKey[key] ??= <String>[]).add(point);
     }
     _reportDuplicates(pointsOfKey);
-    return mounts;
+    return SmbMountTable(mounts, submounts);
   }
 
   /// 同一个共享对应多个挂载点就是重复挂载，组合变化时才记一次日志
@@ -99,7 +113,7 @@ class MacSmb {
       return '源端地址或共享名未填写完整';
     }
 
-    final existing = (await smbMounts())[keyOf(link)];
+    final existing = (await smbMounts()).points[keyOf(link)];
     if (existing != null) {
       Log.i('mount', '$who 系统中已存在挂载点 $existing，只同步访问路径');
       await _syncAlias(link, existing);
@@ -124,7 +138,7 @@ class MacSmb {
     final deadline = DateTime.now().add(timeout);
     while (DateTime.now().isBefore(deadline)) {
       await Future<void>.delayed(const Duration(milliseconds: 800));
-      final point = (await smbMounts())[keyOf(link)];
+      final point = (await smbMounts()).points[keyOf(link)];
       if (point != null) {
         Log.i('mount', '$who 挂载完成 -> $point，耗时 ${Log.ms(started)}ms');
         await _syncAlias(link, point);
@@ -140,7 +154,7 @@ class MacSmb {
   static Future<String?> unmount(ShareLink link) async {
     final started = DateTime.now();
     final who = '${link.displayName} (${keyOf(link)})';
-    final point = (await smbMounts())[keyOf(link)];
+    final point = (await smbMounts()).points[keyOf(link)];
     if (point == null) {
       Log.i('unmount', '$who 系统中查无挂载点，只清理访问路径');
       await _removeAlias(link);

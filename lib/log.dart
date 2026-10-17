@@ -8,6 +8,9 @@ class Log {
   /// 日志保留天数，过期文件在进程首次写日志时清理
   static const int keepDays = 7;
 
+  /// 单行字符上限：挂载表这类内容爆炸时一行能有几百 KB，必须兜住
+  static const int maxLineLength = 4096;
+
   static const String _tag = 'win_share';
 
   static bool _prepared = false;
@@ -45,7 +48,12 @@ class Log {
     final now = DateTime.now();
     try {
       _prepare(now);
-      final line = '${now.toIso8601String()} $level [$tag] $message\n';
+      // 挂载表这类内容一旦爆炸，一行能写到几百 KB，把当天日志推到几百 MB
+      var body = message;
+      if (body.length > maxLineLength) {
+        body = '${body.substring(0, maxLineLength)}…（已截断，原长 ${body.length}）';
+      }
+      final line = '${now.toIso8601String()} $level [$tag] $body\n';
       File(filePath).writeAsStringSync(line, mode: FileMode.append, flush: true);
     } catch (_) {
       // 磁盘满、目录无权限等情况下放弃这一行，不向上抛
