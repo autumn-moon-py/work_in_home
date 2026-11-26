@@ -99,7 +99,8 @@ Windows 那台机器上装了多个 Flutter（PATH 上的 `flutter` 与 `fvm` �
 - **驱动 Windows 的 PowerShell 必须用 `pwsh` 且不带 `-ExecutionPolicy`**（`publish_mac.dart` 的 `_runOnWindows`、`smb_win.dart` 的 `_runLocal`/`_runElevated`）。实测：`-ExecutionPolicy Bypass` 与 `-EncodedCommand` 同时出现时，整条命令会被本机安全策略静默杀掉（无任何输出、退出码 -1）；`powershell`（5.1）即使是 ssh 的直接子进程、只带 `-NoProfile -EncodedCommand` 也同样被杀（ssh 返回 255）。表现是「发布并映射」每一步都失败，但日志里看不到任何 PowerShell 报错。
 - **共享区不能用符号链接**：macOS 的 SMB 服务会把链接原样交给 Windows，Windows 无法解析，所以共享区必须是容器目录内的真实子目录。
 - **SSH 会话里看不到盘符映射**，也不能用 `cmdkey` 存凭据；Windows 侧的相关实现绕开了这两点，别改回去。
-- **自动挂载只在 Mac 侧**（`windowsToMac` 方向）。触发条件是：启动首轮、本轮前处于已挂载、或对端由不可达转为可达；并受 `_retryAfter` 退避约束，避免认证失败反复弹窗。改这段逻辑（`side_mac.dart` 的 `checkHealth`）要连"掉线期间重挂窗口会被消耗"这条一起考虑。
+- **自动挂载只在 Mac 侧**（`windowsToMac` 方向）。触发条件是：启动首轮、本轮前处于已挂载、对端由不可达转为可达、或上次失败仍在重试队列里；失败后按 1/2/5/15/30 分钟阶梯继续重试，既避免认证失败反复弹窗，也不至于一次失败就永久放弃。改这段逻辑（`side_mac.dart` 的 `checkHealth`）要连"掉线期间重挂窗口会被消耗"这条一起考虑。
+- **挂载表只认两段式 `host/share`**：共享内联接点（junction）被 macOS 访问时会按需建立 `host/share/sub/...` 的子挂载，遍历共享区能膨胀到上千条。`smbMounts()` 把这类条目归入 `submounts` 只做告警，不参与挂载状态判定。
 - **Windows 侧的自动挂载靠盘符**：`net use /persistent:yes` 让整个容器在登录后恢复，共享区子文件夹随盘符一起出现，没有逐条挂载。
 - **开机自启动两端各有一套，开关状态都以系统为唯一真相**，不在 `shares.json` 里另存；两边的登记都记着**当时的可执行文件绝对路径**，所以 `flutter clean`、换构建产物或搬目录后，都要在界面上重新点一次开关。
   - Mac：`SMAppService.mainApp`（要求 macOS 13+，更低版本原生侧回 `unsupported`），入口在菜单栏菜单里。本应用是 adhoc 签名、无 Team ID，若 `register()` 报 `Operation not permitted`，先怀疑签名而不是代码。

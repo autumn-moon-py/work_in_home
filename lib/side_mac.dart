@@ -28,12 +28,17 @@ class MacSide implements LocalSide {
   final Map<String, String> _attempted = <String, String>{};
   final Map<String, bool> _prevMounted = <String, bool>{};
   final Map<String, DateTime> _retryAfter = <String, DateTime>{};
+  /// linkId -> 连续自动挂载失败次数：失败后按阶梯继续重试，
+  /// 不能等一次对端状态翻转，否则一次失败就会一直空着
+  final Map<String, int> _failures = <String, int>{};
+  /// 自动挂载失败后的重试间隔（分钟），用完停在最后一档
+  static const List<int> _backoffMinutes = <int>[1, 2, 5, 15, 30];
   /// linkId -> 上一轮对端是否可达：掉线期间"重挂窗口"会被消耗掉，
   /// 靠这里的翻转把"对端恢复"补成一次新的自动挂载机会
   final Map<String, bool> _prevReachable = <String, bool>{};
   /// linkId -> 因"对端不可达"清掉过残留挂载，等对端恢复后补挂一次。
   /// 残留挂载被清掉后"上一轮已挂载"这个重挂窗口就没了，靠这里补机会；
-  /// 只允许一次尝试，挂载失败（例如认证）不再无限重试
+  /// 后续失败由 [_failures] 的阶梯退避接管
   final Set<String> _pendingRemount = <String>{};
   /// host -> 本轮巡检的可达结论：同一个对端的多个共享区只探一次，
   /// 免得同轮给出互相矛盾的判定（一个判掉线被卸载、另一个判正常）
@@ -289,7 +294,7 @@ class MacSide implements LocalSide {
         // 对端掉线留下的挂载点必须先清掉，否则 Finder 会一直转圈
         Log.w('health', '${link.displayName} 对端不可达但仍有挂载，先清理残留挂载点');
         _busy.add(link.id);
-        await MacSmb.unmount(link);
+        await MacSmb.unmount(link, force: true);
         _busy.remove(link.id);
         _retryAfter[link.id] = DateTime.now().add(const Duration(seconds: 10));
         _pendingRemount.add(link.id);
@@ -297,10 +302,13 @@ class MacSide implements LocalSide {
         // 只在启动首轮、"原本已挂载但掉线"或"对端从不可达恢复"时自动重挂，
         // 避免认证失败后反复弹出系统登录窗
         final fingerprint = _fingerprintOf(link);
+        // 失败过的共享区即便没等到状态翻转也要继续重试，只是间隔逐次拉长
+        final failures = _failures[link.id] ?? 0;
         final shouldTry = (initial && _attempted[link.id] != fingerprint) ||
             _prevMounted[link.id] == true ||
             recovered ||
-            _pendingRemount.contains(link.id);
+            _pendingRemount.contains(link.id) ||
+            failures > 0;
         final retryAt = _retryAfter[link.id];
         final ready = retryAt == null || DateTime.now().isAfter(retryAt);
         final skipReason = !shouldTry
@@ -314,17 +322,26 @@ class MacSide implements LocalSide {
         }
         if (shouldTry && ready) {
           Log.i('health',
-              '${link.displayName} 触发自动挂载（首轮=$initial，对端恢复=$recovered）');
+              '${link.displayName} 触发自动挂载（首轮=$initial，对端恢复=$recovered，连续失败=$failures）');
           _busy.add(link.id);
           final error = await MacSmb.mount(link);
           _busy.remove(link.id);
-          _attempted[link.id] = fingerprint;
           _pendingRemount.remove(link.id);
-          Log.i('health',
-              error == null ? '${link.displayName} 自动挂载成功' : '${link.displayName} 自动挂载失败：$error');
-          // ponytail: 固定 30 秒退避，够用；若认证频繁失败再考虑指数退避
-          _retryAfter[link.id] =
-              DateTime.now().add(Duration(seconds: error == null ? 0 : 30));
+          if (error == null) {
+            _attempted[link.id] = fingerprint;
+            _failures[link.id] = 0;
+            _retryAfter[link.id] = DateTime.now();
+            Log.i('health', '${link.displayName} 自动挂载成功');
+          } else {
+            final index = failures < _backoffMinutes.length
+                ? failures
+                : _backoffMinutes.length - 1;
+            final wait = _backoffMinutes[index];
+            _failures[link.id] = failures + 1;
+            _retryAfter[link.id] = DateTime.now().add(Duration(minutes: wait));
+            Log.w('health',
+                '${link.displayName} 自动挂载失败：$error（$wait 分钟后重试）');
+          }
         }
       }
       _prevMounted[link.id] = mounted;

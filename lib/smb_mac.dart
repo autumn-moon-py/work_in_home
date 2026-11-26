@@ -67,9 +67,13 @@ class MacSmb {
       if (at >= 0) source = source.substring(at + 1);
       final key = _decodePercent(source).toLowerCase();
       final point = rest.substring(0, pathEnd);
+      // 共享名之后还有路径段的是 macOS 给共享内联接点按需建立的子挂载，
+      // 遍历共享区时会膨胀到上千条：只留作告警，不参与状态判定与巡检
+      if (key.split('/').length > 2) {
+        submounts.add(key);
+        continue;
+      }
       mounts[key] = point;
-      // 按需建立的子挂载带 automounted 选项，据此与正常挂载区分
-      if (rest.substring(pathEnd).contains('automounted')) submounts.add(key);
       (pointsOfKey[key] ??= <String>[]).add(point);
     }
     _reportDuplicates(pointsOfKey);
@@ -150,8 +154,11 @@ class MacSmb {
     return '等待系统挂载超时；若弹出了认证窗口，请完成登录后重试';
   }
 
-  /// 卸载成功返回 null，失败返回错误原因
-  static Future<String?> unmount(ShareLink link) async {
+  /// 卸载成功返回 null，失败返回错误原因。
+  ///
+  /// [force] 用于对端已不可达的场景：此时普通卸载必然卡在等待 I/O 超时上，
+  /// 直接 force 能省掉几十秒假死
+  static Future<String?> unmount(ShareLink link, {bool force = false}) async {
     final started = DateTime.now();
     final who = '${link.displayName} (${keyOf(link)})';
     final point = (await smbMounts()).points[keyOf(link)];
@@ -161,8 +168,12 @@ class MacSmb {
       return null;
     }
     // 对端掉线后留下的挂载点会假死，普通卸载可能卡住，失败即转强制卸载
-    var result = await Process.run(_diskutil, <String>['unmount', point]);
-    if (result.exitCode != 0) {
+    var result = await Process.run(
+        _diskutil,
+        force
+            ? <String>['unmount', 'force', point]
+            : <String>['unmount', point]);
+    if (!force && result.exitCode != 0) {
       Log.w('unmount',
           '$who 常规卸载 $point 失败（exit=${result.exitCode}），转强制卸载');
       result = await Process.run(_diskutil, <String>['unmount', 'force', point]);
